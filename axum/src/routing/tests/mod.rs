@@ -691,3 +691,45 @@ async fn routes_must_start_with_slash() {
     let app = Router::new().route(":foo", get(|| async {}));
     TestClient::new(app);
 }
+
+#[tokio::test]
+async fn overlapping_params() {
+    #[derive(Deserialize)]
+    struct A {
+        a: String,
+    }
+
+    #[derive(Deserialize)]
+    struct BC {
+        b: String,
+        c: String,
+    }
+
+    let app = Router::new()
+        .route(
+            "/:a",
+            get(|Path(A { a }): Path<A>| async move { format!("a={}", a) }),
+        )
+        .route(
+            "/:b/:c",
+            get(|Path(BC { b, c }): Path<BC>| async move { format!("b={} c={}", b, c) }),
+        );
+
+    let client = TestClient::new(app);
+
+    assert_eq!(client.get("/foo").send().await.text().await, "a=foo");
+    assert_eq!(
+        client.get("/foo/bar").send().await.text().await,
+        "b=foo c=bar"
+    );
+}
+
+#[tokio::test]
+async fn overlapping_nested() {
+    todo!()
+}
+
+#[tokio::test]
+async fn overlapping_nested_opaque() {
+    todo!()
+}

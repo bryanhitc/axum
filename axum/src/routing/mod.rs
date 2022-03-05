@@ -1,5 +1,6 @@
 //! Routing between [`Service`]s and handlers.
 
+use self::url_params::NormalizePathParams;
 use self::{future::RouteFuture, not_found::NotFound};
 use crate::{
     body::{boxed, Body, Bytes, HttpBody},
@@ -66,6 +67,7 @@ pub struct Router<B = Body> {
     node: Node,
     fallback: Fallback<B>,
     nested_at_root: bool,
+    normalize_path_params: NormalizePathParams,
 }
 
 impl<B> Clone for Router<B> {
@@ -75,6 +77,7 @@ impl<B> Clone for Router<B> {
             node: self.node.clone(),
             fallback: self.fallback.clone(),
             nested_at_root: self.nested_at_root,
+            normalize_path_params: self.normalize_path_params.clone(),
         }
     }
 }
@@ -95,6 +98,7 @@ impl<B> fmt::Debug for Router<B> {
             .field("node", &self.node)
             .field("fallback", &self.fallback)
             .field("nested_at_root", &self.nested_at_root)
+            .field("params_mapping", &self.normalize_path_params)
             .finish()
     }
 }
@@ -116,6 +120,7 @@ where
             node: Default::default(),
             fallback: Fallback::Default(Route::new(NotFound)),
             nested_at_root: false,
+            normalize_path_params: Default::default(),
         }
     }
 
@@ -140,12 +145,14 @@ where
 
         let id = RouteId::next();
 
+        let path = self.normalize_path_params.normalize_route_params(path);
+
         let service = match try_downcast::<MethodRouter<B, Infallible>, _>(service) {
             Ok(method_router) => {
                 if let Some((route_id, Endpoint::MethodRouter(prev_method_router))) = self
                     .node
                     .path_to_route_id
-                    .get(path)
+                    .get(&*path)
                     .and_then(|route_id| self.routes.get(route_id).map(|svc| (*route_id, svc)))
                 {
                     // if we're adding a new `MethodRouter` to a route that already has one just
@@ -204,6 +211,7 @@ where
                     // doesn't mean something is nested at root in _this_ router
                     // thus we don't need to propagate that
                     nested_at_root: _,
+                    normalize_path_params: params_mapping,
                 } = router;
 
                 if let Fallback::Custom(_) = fallback {
@@ -211,9 +219,12 @@ where
                 }
 
                 for (id, nested_path) in node.route_id_to_path {
+                    let nested_path = params_mapping.get_original_path(&nested_path);
+
                     let route = routes.remove(&id).unwrap();
+
                     let full_path: Cow<str> = if &*nested_path == "/" {
-                        path.into()
+                        Cow::Borrowed(path)
                     } else if path == "/" {
                         (&*nested_path).into()
                     } else if let Some(path) = path.strip_suffix('/') {
@@ -221,6 +232,7 @@ where
                     } else {
                         format!("{}{}", path, nested_path).into()
                     };
+
                     self = match route {
                         Endpoint::MethodRouter(method_router) => self.route(
                             &full_path,
@@ -259,6 +271,7 @@ where
             node,
             fallback,
             nested_at_root,
+            normalize_path_params: params_mapping,
         } = other.into();
 
         for (id, route) in routes {
@@ -282,6 +295,8 @@ where
         };
 
         self.nested_at_root = self.nested_at_root || nested_at_root;
+
+        self.normalize_path_params.merge(params_mapping);
 
         self
     }
@@ -324,6 +339,7 @@ where
             node: self.node,
             fallback,
             nested_at_root: self.nested_at_root,
+            normalize_path_params: self.normalize_path_params,
         }
     }
 
@@ -363,6 +379,7 @@ where
             node: self.node,
             fallback: self.fallback,
             nested_at_root: self.nested_at_root,
+            normalize_path_params: self.normalize_path_params,
         }
     }
 
@@ -422,9 +439,20 @@ where
         let id = *match_.value;
         req.extensions_mut().insert(id);
 
+        let matched_path = self
+            .node
+            .route_id_to_path
+            .get(&id)
+            .expect("should always have a matched path for a route id");
+
         #[cfg(feature = "matched-path")]
-        if let Some(matched_path) = self.node.route_id_to_path.get(&id) {
+        {
             use crate::extract::MatchedPath;
+
+            let matched_path: Arc<str> = self
+                .normalize_path_params
+                .get_original_path(&**matched_path)
+                .into();
 
             let matched_path = if let Some(previous) = req.extensions_mut().get::<MatchedPath>() {
                 // a previous `MatchedPath` might exist if we're inside a nested Router
@@ -439,15 +467,17 @@ where
                 let matched_path = format!("{}{}", previous, matched_path);
                 matched_path.into()
             } else {
-                Arc::clone(matched_path)
+                matched_path
             };
             req.extensions_mut().insert(MatchedPath(matched_path));
-        } else {
-            #[cfg(debug_assertions)]
-            panic!("should always have a matched path for a route id");
         }
 
-        url_params::insert_url_params(req.extensions_mut(), match_.params);
+        url_params::insert_url_params(
+            req.extensions_mut(),
+            match_.params,
+            &**matched_path,
+            &self.normalize_path_params,
+        );
 
         let mut route = self
             .routes
@@ -462,6 +492,16 @@ where
     }
 
     fn panic_on_matchit_error(&self, err: matchit::InsertError) {
+        let err = match err {
+            matchit::InsertError::Conflict { with } => matchit::InsertError::Conflict {
+                with: self
+                    .normalize_path_params
+                    .get_original_path(&with)
+                    .to_owned(),
+            },
+            _ => err,
+        };
+
         if self.nested_at_root {
             panic!(
                 "Invalid route: {}. Note that `nest(\"/\", _)` conflicts with all routes. Use `Router::fallback` instead",
