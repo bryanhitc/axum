@@ -21,29 +21,27 @@ use axum::{
     routing::{get, patch},
     Json, Router,
 };
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    sync::{Arc, RwLock},
-    time::Duration,
-};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use tower::{BoxError, ServiceBuilder};
-use tower_http::trace::TraceLayer;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tower_http::{
+    add_extension::AddExtensionLayer,
+    trace::{DefaultOnResponse, TraceLayer},
+    LatencyUnit,
+};
 use uuid::Uuid;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "example_todos=debug,tower_http=debug".into()),
-        ))
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    // Set the RUST_LOG, if it hasn't been explicitly defined
+    if std::env::var_os("RUST_LOG").is_none() {
+        std::env::set_var("RUST_LOG", "example_todos=debug,tower_http=debug")
+    }
+    tracing_subscriber::fmt::init();
 
-    let db = Db::default();
+    let db = create_seed_db(10000);
+    let micros_on_response = DefaultOnResponse::default().latency_unit(LatencyUnit::Micros);
 
     // Compose the routes
     let app = Router::new()
@@ -63,8 +61,8 @@ async fn main() {
                     }
                 }))
                 .timeout(Duration::from_secs(10))
-                .layer(TraceLayer::new_for_http())
-                .layer(Extension(db))
+                .layer(TraceLayer::new_for_http().on_response(micros_on_response))
+                .layer(AddExtensionLayer::new(db))
                 .into_inner(),
         );
 
@@ -74,6 +72,22 @@ async fn main() {
         .serve(app.into_make_service())
         .await
         .unwrap();
+}
+
+fn create_seed_db(num_todos: usize) -> Db {
+    let mut todos = HashMap::with_capacity(num_todos);
+
+    for i in 0..num_todos {
+        let todo = Todo {
+            id: Uuid::new_v4(),
+            text: format!("Todo {}", i),
+            completed: false,
+        };
+
+        todos.insert(todo.id, todo);
+    }
+
+    Db::new(RwLock::new(todos))
 }
 
 // The query parameters for todos index
@@ -87,16 +101,17 @@ async fn todos_index(
     pagination: Option<Query<Pagination>>,
     Extension(db): Extension<Db>,
 ) -> impl IntoResponse {
-    let todos = db.read().unwrap();
-
     let Query(pagination) = pagination.unwrap_or_default();
 
-    let todos = todos
-        .values()
-        .skip(pagination.offset.unwrap_or(0))
-        .take(pagination.limit.unwrap_or(usize::MAX))
-        .cloned()
-        .collect::<Vec<_>>();
+    let todos = {
+        let all_todos = db.read();
+        all_todos
+            .values()
+            .skip(pagination.offset.unwrap_or(0))
+            .take(pagination.limit.unwrap_or(usize::MAX))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
 
     Json(todos)
 }
@@ -116,9 +131,10 @@ async fn todos_create(
         completed: false,
     };
 
-    db.write().unwrap().insert(todo.id, todo.clone());
+    let json = Json(todo.clone());
+    db.write().insert(todo.id, todo);
 
-    (StatusCode::CREATED, Json(todo))
+    (StatusCode::CREATED, json)
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,12 +148,7 @@ async fn todos_update(
     Json(input): Json<UpdateTodo>,
     Extension(db): Extension<Db>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let mut todo = db
-        .read()
-        .unwrap()
-        .get(&id)
-        .cloned()
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let mut todo = db.read().get(&id).cloned().ok_or(StatusCode::NOT_FOUND)?;
 
     if let Some(text) = input.text {
         todo.text = text;
@@ -147,13 +158,13 @@ async fn todos_update(
         todo.completed = completed;
     }
 
-    db.write().unwrap().insert(todo.id, todo.clone());
+    db.write().insert(todo.id, todo.clone());
 
     Ok(Json(todo))
 }
 
 async fn todos_delete(Path(id): Path<Uuid>, Extension(db): Extension<Db>) -> impl IntoResponse {
-    if db.write().unwrap().remove(&id).is_some() {
+    if db.write().remove(&id).is_some() {
         StatusCode::NO_CONTENT
     } else {
         StatusCode::NOT_FOUND
